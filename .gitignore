@@ -1,0 +1,12 @@
+# Ignore everything in the root
+/*
+
+# Allow files and folders with a pattern starting with !
+!*.go
+!.gitignore
+!/examples/
+!LICENSE
+!Makefile
+!README.md
+!go.mod
+!go.sum
