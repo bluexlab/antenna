@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -120,10 +119,6 @@ func (a *Antenna) Stop() {
 }
 
 func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Generation) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
 	for topic, assignments := range generation.Assignments {
 		for _, assignment := range assignments {
 			partition, offset := assignment.ID, assignment.Offset
@@ -131,25 +126,28 @@ func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Gener
 				logger.Printf("topic %s partition %d offset %d", topic, partition, offset)
 			})
 
+			// get last processed offset from offset provider
 			if a.offsetProvider != nil {
 				lastOffset, err := a.offsetProvider.GetOffset(ctx, topic, partition)
 				if err != nil {
 					if !errors.Is(err, sql.ErrNoRows) {
 						return fmt.Errorf("failed to get offset for topic %s partition %d: %w", topic, partition, err)
 					}
+
 					offset = kafka.FirstOffset
+					a.withLogger(func(logger Logger) {
+						logger.Printf("no offset found for topic %s partition %d, set offset to %d", topic, partition, kafka.FirstOffset)
+					})
 				} else {
+					// the expected offset is the last processed offset + 1
 					offset = lastOffset + 1
+					a.withLogger(func(logger Logger) {
+						logger.Printf("set offset for topic %s partition %d to %d", topic, partition, offset)
+					})
 				}
-				a.withLogger(func(logger Logger) {
-					logger.Printf("offset for topic %s partition %d is set to %d", topic, partition, offset)
-				})
 			}
 
-			wg.Add(1)
 			generation.Start(func(ctx context.Context) {
-				defer wg.Done()
-
 				readerConfig := kafka.ReaderConfig{
 					Brokers:   a.brokers,
 					Topic:     topic,
@@ -162,10 +160,10 @@ func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Gener
 					a.withErrorLogger(func(logger Logger) {
 						logger.Printf("failed to set offset for topic %s partition %d: %v", topic, partition, err)
 					})
-					cancel()
 					return
 				}
 
+				// read messages from kafka
 				for {
 					msg, err := reader.ReadMessage(ctx)
 					if errors.Is(err, kafka.ErrGenerationEnded) {
@@ -178,14 +176,12 @@ func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Gener
 								logger.Printf("failed to commit offset for topic %s partition %d: %v", topic, partition, err)
 							})
 						}
-						cancel()
 						return
 					}
 					if err != nil {
 						a.withErrorLogger(func(logger Logger) {
 							logger.Printf("failed to read message from topic %s partition %d: %v", topic, partition, err)
 						})
-						cancel()
 						return
 					}
 
@@ -197,12 +193,12 @@ func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Gener
 					if a.handler == nil {
 						continue
 					}
+					// send kafka message to message handler
 					err = a.handler.Process(ctx, msg)
 					if err != nil {
 						a.withErrorLogger(func(logger Logger) {
 							logger.Printf("failed to process message from topic %s partition %d: %v", topic, partition, err)
 						})
-						cancel()
 						return
 					}
 				}
@@ -210,7 +206,6 @@ func (a *Antenna) processGeneration(ctx context.Context, generation *kafka.Gener
 		}
 	}
 
-	wg.Wait()
 	return nil
 }
 
